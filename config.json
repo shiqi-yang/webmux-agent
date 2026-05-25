@@ -1,0 +1,9 @@
+{
+  "hubUrl": "http://127.0.0.1:8080",
+  "username": "testuser",
+  "password": "testpass123",
+  "reconnect": {
+    "initialDelay": 1000,
+    "maxDelay": 30000
+  }
+}

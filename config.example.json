@@ -1,0 +1,9 @@
+{
+  "hubUrl": "https://your-hub.example.com",
+  "username": "alice",
+  "password": "yourpassword",
+  "reconnect": {
+    "initialDelay": 1000,
+    "maxDelay": 30000
+  }
+}
