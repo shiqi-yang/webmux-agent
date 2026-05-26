@@ -15,20 +15,36 @@ function broadcastChange() {
   changeCallbacks.forEach(cb => cb());
 }
 
-function listSessions() {
+function listSessions(managedOnly = false) {
   try {
     const out = execFileSync(
       'tmux',
-      ['list-sessions', '-F', '#{session_name}\t#{session_windows}\t#{session_created_string}'],
+      ['list-sessions', '-F', '#{@webmux_managed}\t#{session_name}\t#{session_windows}\t#{session_created_string}'],
       { encoding: 'utf8' }
     ).trim();
     if (!out) return [];
-    return out.split('\n').map(line => {
-      const [name, windows, created] = line.split('\t');
-      return { name, windows: Number(windows), created };
-    });
+    return out.split('\n')
+      .map(line => {
+        const [managed, name, windows, created] = line.split('\t');
+        return { name, windows: Number(windows), created, _managed: managed === '1' };
+      })
+      .filter(s => !managedOnly || s._managed)
+      .map(({ name, windows, created }) => ({ name, windows, created }));
   } catch {
     return [];
+  }
+}
+
+function isManaged(name) {
+  try {
+    const val = execFileSync(
+      'tmux',
+      ['display-message', '-t', name, '-p', '#{@webmux_managed}'],
+      { encoding: 'utf8' }
+    ).trim();
+    return val === '1';
+  } catch {
+    return false;
   }
 }
 
@@ -44,6 +60,7 @@ function hasSession(name) {
 function createSession(name) {
   if (hasSession(name)) throw new Error('Session already exists');
   execFileSync('tmux', ['new-session', '-d', '-s', name]);
+  execFileSync('tmux', ['set-option', '-t', name, '@webmux_managed', '1']);
   broadcastChange();
 }
 
@@ -104,7 +121,7 @@ function getSessionCwd(sessionName) {
 }
 
 module.exports = {
-  listSessions, hasSession,
+  listSessions, hasSession, isManaged,
   createSession, renameSession, killSession,
   attachPty, resizePty, getSessionCwd,
   onSessionChange,

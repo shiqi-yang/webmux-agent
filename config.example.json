@@ -2,6 +2,7 @@
   "hubUrl": "https://your-hub.example.com",
   "username": "alice",
   "password": "yourpassword",
+  "managedOnly": false,
   "reconnect": {
     "initialDelay": 1000,
     "maxDelay": 30000

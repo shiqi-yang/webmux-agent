@@ -21,6 +21,7 @@ function loadConfig() {
     file = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   }
 
+  const managedOnlyEnv = process.env.MANAGED_ONLY;
   const cfg = {
     hubUrl: (process.env.HUB_URL || file.hubUrl || '').replace(/\/$/, ''),
     username: process.env.AGENT_USERNAME || file.username,
@@ -29,6 +30,9 @@ function loadConfig() {
       initialDelay: file.reconnect?.initialDelay ?? 1000,
       maxDelay: file.reconnect?.maxDelay ?? 30000,
     },
+    managedOnly: managedOnlyEnv !== undefined
+      ? managedOnlyEnv === 'true' || managedOnlyEnv === '1'
+      : (file.managedOnly ?? false),
   };
 
   if (!cfg.hubUrl || !cfg.username || !cfg.password) {
@@ -118,13 +122,18 @@ function reply(requestId, payload) {
 }
 
 function sendSessions() {
-  send({ type: 'sessions', list: ptyManager.listSessions() });
+  send({ type: 'sessions', list: ptyManager.listSessions(config.managedOnly) });
 }
 
 // ── Message handlers ───────────────────────────────────────────────────────────
 
 function handleAttach(msg) {
   const { requestId, channelId, sessionName, cols, rows } = msg;
+
+  if (config.managedOnly && !ptyManager.isManaged(sessionName)) {
+    reply(requestId, { ok: false, error: 'Session not managed by webmux' });
+    return;
+  }
 
   const p = ptyManager.attachPty(
     sessionName,
