@@ -62,7 +62,7 @@ async function registerWithHub() {
   if (res.ok) {
     console.log(`Registered account "${config.username}" on Hub.`);
   } else if (res.status === 409) {
-    // Account already exists — normal on subsequent starts
+    console.log(`Account "${config.username}" already exists on Hub, proceeding to login.`);
   } else {
     const body = await res.json().catch(() => ({}));
     throw new Error(`Register failed (${res.status}): ${body.error || res.statusText}`);
