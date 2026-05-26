@@ -21,7 +21,7 @@ function listSessions(managedOnly = false) {
       'tmux',
       ['list-sessions', '-F', '#{@webmux_managed}\t#{session_name}\t#{session_windows}\t#{session_created_string}'],
       { encoding: 'utf8' }
-    ).trim();
+    ).trimEnd();
     if (!out) return [];
     return out.split('\n')
       .map(line => {
