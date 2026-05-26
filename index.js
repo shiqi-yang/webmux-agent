@@ -2,48 +2,32 @@ const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
 const ptyManager = require('./ptyManager');
+const { runSetup } = require('./setup');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-function loadConfig() {
-  let configPath = path.join(__dirname, 'config.json');
-
+function resolveConfigPath() {
   const args = process.argv.slice(2);
   const flagIdx = args.indexOf('--config');
-  if (flagIdx !== -1 && args[flagIdx + 1]) {
-    configPath = args[flagIdx + 1];
-  } else if (args[0] && !args[0].startsWith('--')) {
-    configPath = args[0];
-  }
-
-  let file = {};
-  if (fs.existsSync(configPath)) {
-    file = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-  }
-
-  const managedOnlyEnv = process.env.MANAGED_ONLY;
-  const cfg = {
-    hubUrl: (process.env.HUB_URL || file.hubUrl || '').replace(/\/$/, ''),
-    username: process.env.AGENT_USERNAME || file.username,
-    password: process.env.AGENT_PASSWORD || file.password,
-    reconnect: {
-      initialDelay: file.reconnect?.initialDelay ?? 1000,
-      maxDelay: file.reconnect?.maxDelay ?? 30000,
-    },
-    managedOnly: managedOnlyEnv !== undefined
-      ? managedOnlyEnv === 'true' || managedOnlyEnv === '1'
-      : (file.managedOnly ?? false),
-  };
-
-  if (!cfg.hubUrl || !cfg.username || !cfg.password) {
-    console.error('Missing required config: hubUrl, username, password');
-    process.exit(1);
-  }
-
-  return cfg;
+  if (flagIdx !== -1 && args[flagIdx + 1]) return args[flagIdx + 1];
+  if (args[0] && !args[0].startsWith('--')) return args[0];
+  return path.join(__dirname, 'config.json');
 }
 
-const config = loadConfig();
+function applyEnvOverrides(cfg) {
+  const managedOnlyEnv = process.env.MANAGED_ONLY;
+  return {
+    ...cfg,
+    hubUrl:      (process.env.HUB_URL      || cfg.hubUrl   || '').replace(/\/$/, ''),
+    username:    process.env.AGENT_USERNAME || cfg.username,
+    password:    process.env.AGENT_PASSWORD || cfg.password,
+    managedOnly: managedOnlyEnv !== undefined
+      ? managedOnlyEnv === 'true' || managedOnlyEnv === '1'
+      : (cfg.managedOnly ?? false),
+  };
+}
+
+let config;
 
 // ── Binary frame helpers (must match hub/router.js) ───────────────────────────
 
@@ -65,7 +49,7 @@ function decodeChannelId(buf) {
 const channels = new Map();
 
 let ws = null;
-let reconnectDelay = config.reconnect.initialDelay;
+let reconnectDelay = 1000;
 
 // ── Hub HTTP calls ─────────────────────────────────────────────────────────────
 
@@ -368,8 +352,25 @@ async function registerAndLogin() {
   return loginToHub();
 }
 
-// Re-send session list whenever local tmux sessions change
-ptyManager.onSessionChange(sendSessions);
+// ── Startup ───────────────────────────────────────────────────────────────────
 
-console.log(`Starting agent as "${config.username}" → ${config.hubUrl}`);
-connect();
+(async () => {
+  const allFromEnv = process.env.HUB_URL && process.env.AGENT_USERNAME && process.env.AGENT_PASSWORD;
+
+  if (allFromEnv) {
+    config = applyEnvOverrides({});
+  } else {
+    const fileCfg = await runSetup(resolveConfigPath());
+    config = applyEnvOverrides(fileCfg);
+  }
+
+  if (!config.hubUrl || !config.username || !config.password) {
+    console.error('Missing required config: hubUrl, username, password');
+    process.exit(1);
+  }
+
+  reconnectDelay = config.reconnect.initialDelay;
+  ptyManager.onSessionChange(sendSessions);
+  console.log(`Starting agent as "${config.username}" → ${config.hubUrl}`);
+  connect();
+})();
