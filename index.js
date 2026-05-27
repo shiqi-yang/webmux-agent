@@ -257,13 +257,15 @@ function handleUpload(msg) {
     return;
   }
 
-  const conflicts = msg.files
-    .map(f => f.filename)
-    .filter(name => fs.existsSync(path.join(cwd, name)));
+  if (!msg.overwrite) {
+    const conflicts = msg.files
+      .map(f => f.filename)
+      .filter(name => fs.existsSync(path.join(cwd, name)));
 
-  if (conflicts.length > 0) {
-    reply(msg.requestId, { ok: false, error: 'conflict', conflicts });
-    return;
+    if (conflicts.length > 0) {
+      reply(msg.requestId, { ok: false, error: 'conflict', conflicts });
+      return;
+    }
   }
 
   try {
