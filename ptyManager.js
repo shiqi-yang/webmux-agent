@@ -39,7 +39,7 @@ function isManaged(name) {
   try {
     const val = execFileSync(
       'tmux',
-      ['display-message', '-t', name, '-p', '#{@webmux_managed}'],
+      ['display-message', '-t', `=${name}`, '-p', '#{@webmux_managed}'],
       { encoding: 'utf8' }
     ).trim();
     return val === '1';
@@ -50,7 +50,7 @@ function isManaged(name) {
 
 function hasSession(name) {
   try {
-    execFileSync('tmux', ['has-session', '-t', name], { stdio: 'ignore' });
+    execFileSync('tmux', ['has-session', '-t', `=${name}`], { stdio: 'ignore' });
     return true;
   } catch {
     return false;
@@ -60,13 +60,13 @@ function hasSession(name) {
 function createSession(name) {
   if (hasSession(name)) throw new Error('Session already exists');
   execFileSync('tmux', ['new-session', '-d', '-s', name]);
-  execFileSync('tmux', ['set-option', '-t', name, '@webmux_managed', '1']);
+  execFileSync('tmux', ['set-option', '-t', `=${name}`, '@webmux_managed', '1']);
   broadcastChange();
 }
 
 function renameSession(oldName, newName) {
   if (!hasSession(oldName)) throw new Error('Session not found');
-  execFileSync('tmux', ['rename-session', '-t', oldName, newName]);
+  execFileSync('tmux', ['rename-session', '-t', `=${oldName}`, newName]);
   broadcastChange();
 }
 
@@ -77,14 +77,14 @@ function killSession(name) {
     ptys.forEach(p => { try { p.kill(); } catch {} });
     sessionPtys.delete(name);
   }
-  execFileSync('tmux', ['kill-session', '-t', name]);
+  execFileSync('tmux', ['kill-session', '-t', `=${name}`]);
   broadcastChange();
 }
 
 function attachPty(sessionName, onData, onExit, cols = 220, rows = 50) {
   if (!hasSession(sessionName)) return null;
 
-  const p = pty.spawn('tmux', ['attach-session', '-t', sessionName], {
+  const p = pty.spawn('tmux', ['attach-session', '-t', `=${sessionName}`], {
     name: 'xterm-256color',
     cols,
     rows,
@@ -105,14 +105,14 @@ function attachPty(sessionName, onData, onExit, cols = 220, rows = 50) {
 
 function resizePty(p, sessionName, cols, rows) {
   try { p.resize(cols, rows); } catch {}
-  execFile('tmux', ['resize-window', '-t', sessionName, '-x', String(cols), '-y', String(rows)]);
+  execFile('tmux', ['resize-window', '-t', `=${sessionName}`, '-x', String(cols), '-y', String(rows)]);
 }
 
 function getSessionCwd(sessionName) {
   try {
     return execFileSync(
       'tmux',
-      ['display-message', '-t', sessionName, '-p', '#{pane_current_path}'],
+      ['display-message', '-t', `=${sessionName}`, '-p', '#{pane_current_path}'],
       { encoding: 'utf8' }
     ).trim();
   } catch {
