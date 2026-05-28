@@ -1,5 +1,6 @@
 node_modules/
 config.json
+managed-sessions.json
 *.local
 .env
 *.log

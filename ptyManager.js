@@ -1,5 +1,51 @@
 const pty = require('node-pty');
 const { execFileSync, execFile } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+// ── Managed-session registry (local file, no tmux options) ────────────────────
+
+const MANAGED_FILE = path.join(__dirname, 'managed-sessions.json');
+
+let managedSessions = new Set();
+
+function loadManaged() {
+  try {
+    const data = JSON.parse(fs.readFileSync(MANAGED_FILE, 'utf8'));
+    managedSessions = new Set(Array.isArray(data) ? data : []);
+  } catch {
+    managedSessions = new Set();
+  }
+}
+
+function saveManaged() {
+  fs.writeFileSync(MANAGED_FILE, JSON.stringify([...managedSessions], null, 2));
+}
+
+loadManaged();
+
+// ── Tmux version detection ────────────────────────────────────────────────────
+
+// Exact-match target prefix `=name` requires tmux >= 3.2
+let exactTargetSupported = false;
+
+(function detectTmuxVersion() {
+  try {
+    const out = execFileSync('tmux', ['-V'], { encoding: 'utf8' }).trim();
+    const m = out.match(/tmux (\d+)\.(\d+)/);
+    if (m) {
+      const [, maj, min] = m.map(Number);
+      exactTargetSupported = maj > 3 || (maj === 3 && min >= 2);
+    }
+    console.log(`Detected ${out} — exact target ${exactTargetSupported ? 'enabled' : 'disabled'}`);
+  } catch {}
+})();
+
+function t(name) {
+  return exactTargetSupported ? `=${name}` : name;
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
 
 // sessionName → Set<pty instance>
 const sessionPtys = new Map();
@@ -19,14 +65,14 @@ function listSessions(managedOnly = false) {
   try {
     const out = execFileSync(
       'tmux',
-      ['list-sessions', '-F', '#{@webmux_managed}\t#{session_name}\t#{session_windows}\t#{session_created_string}'],
+      ['list-sessions', '-F', '#{session_name}\t#{session_windows}\t#{session_created_string}'],
       { encoding: 'utf8' }
     ).trimEnd();
     if (!out) return [];
     return out.split('\n')
       .map(line => {
-        const [managed, name, windows, created] = line.split('\t');
-        return { name, windows: Number(windows), created, _managed: managed === '1' };
+        const [name, windows, created] = line.split('\t');
+        return { name, windows: Number(windows), created, _managed: managedSessions.has(name) };
       })
       .filter(s => !managedOnly || s._managed)
       .map(({ name, windows, created }) => ({ name, windows, created }));
@@ -36,21 +82,12 @@ function listSessions(managedOnly = false) {
 }
 
 function isManaged(name) {
-  try {
-    const val = execFileSync(
-      'tmux',
-      ['display-message', '-t', `=${name}`, '-p', '#{@webmux_managed}'],
-      { encoding: 'utf8' }
-    ).trim();
-    return val === '1';
-  } catch {
-    return false;
-  }
+  return managedSessions.has(name);
 }
 
 function hasSession(name) {
   try {
-    execFileSync('tmux', ['has-session', '-t', `=${name}`], { stdio: 'ignore' });
+    execFileSync('tmux', ['has-session', '-t', t(name)], { stdio: 'ignore' });
     return true;
   } catch {
     return false;
@@ -59,14 +96,26 @@ function hasSession(name) {
 
 function createSession(name) {
   if (hasSession(name)) throw new Error('Session already exists');
-  execFileSync('tmux', ['new-session', '-d', '-s', name]);
-  execFileSync('tmux', ['set-option', '-t', `=${name}`, '@webmux_managed', '1']);
+  execFileSync('tmux', ['new-session', '-d', '-s', name]); // -s takes plain name, not target
+  managedSessions.add(name);
+  try {
+    saveManaged();
+  } catch (e) {
+    managedSessions.delete(name);
+    try { execFileSync('tmux', ['kill-session', '-t', t(name)]); } catch {}
+    throw e;
+  }
   broadcastChange();
 }
 
 function renameSession(oldName, newName) {
   if (!hasSession(oldName)) throw new Error('Session not found');
-  execFileSync('tmux', ['rename-session', '-t', `=${oldName}`, newName]);
+  execFileSync('tmux', ['rename-session', '-t', t(oldName), newName]);
+  if (managedSessions.has(oldName)) {
+    managedSessions.delete(oldName);
+    managedSessions.add(newName);
+    saveManaged();
+  }
   broadcastChange();
 }
 
@@ -77,14 +126,16 @@ function killSession(name) {
     ptys.forEach(p => { try { p.kill(); } catch {} });
     sessionPtys.delete(name);
   }
-  execFileSync('tmux', ['kill-session', '-t', `=${name}`]);
+  execFileSync('tmux', ['kill-session', '-t', t(name)]);
+  managedSessions.delete(name);
+  saveManaged();
   broadcastChange();
 }
 
 function attachPty(sessionName, onData, onExit, cols = 220, rows = 50) {
   if (!hasSession(sessionName)) return null;
 
-  const p = pty.spawn('tmux', ['attach-session', '-t', `=${sessionName}`], {
+  const p = pty.spawn('tmux', ['attach-session', '-t', t(sessionName)], {
     name: 'xterm-256color',
     cols,
     rows,
@@ -105,14 +156,14 @@ function attachPty(sessionName, onData, onExit, cols = 220, rows = 50) {
 
 function resizePty(p, sessionName, cols, rows) {
   try { p.resize(cols, rows); } catch {}
-  execFile('tmux', ['resize-window', '-t', `=${sessionName}`, '-x', String(cols), '-y', String(rows)]);
+  execFile('tmux', ['resize-window', '-t', t(sessionName), '-x', String(cols), '-y', String(rows)]);
 }
 
 function getSessionCwd(sessionName) {
   try {
     return execFileSync(
       'tmux',
-      ['display-message', '-t', `=${sessionName}`, '-p', '#{pane_current_path}'],
+      ['display-message', '-t', t(sessionName), '-p', '#{pane_current_path}'],
       { encoding: 'utf8' }
     ).trim();
   } catch {
