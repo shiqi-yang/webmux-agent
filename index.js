@@ -105,21 +105,30 @@ function createPeerConnection(channelId, sessionName) {
   peerConnections.set(channelId, entry);
 
   pc.onLocalDescription((sdp, type) => {
+    console.log(`[rtc:agent] localDescription type=${type} ch=${entry.channelId}`);
     if (type === 'answer') send({ type: 'rtc-answer', channelId: entry.channelId, sdp });
   });
 
   pc.onLocalCandidate((candidate, mid) => {
+    console.log(`[rtc:agent] localCandidate ch=${entry.channelId} mid=${mid} ${candidate.slice(0, 60)}`);
     send({ type: 'rtc-ice', channelId: entry.channelId, candidate: { candidate, sdpMid: mid } });
   });
 
+  pc.onGatheringStateChange(state => {
+    console.log(`[rtc:agent] gatheringState=${state} ch=${channelId}`);
+  });
+
   pc.onDataChannel(dc => {
+    console.log(`[rtc:agent] dataChannel received ch=${channelId}`);
     entry.dc = dc;
+    dc.onOpen(() => console.log(`[rtc:agent] DC open ch=${channelId}`));
     dc.onMessage(data => handleDcMessage(channelId, data));
-    dc.onClosed(() => handleDcClose(channelId));
-    dc.onError(e => console.error(`DataChannel error [${channelId}]:`, e));
+    dc.onClosed(() => { console.log(`[rtc:agent] DC closed ch=${channelId}`); handleDcClose(channelId); });
+    dc.onError(e => console.error(`[rtc:agent] DC error ch=${channelId}:`, e));
   });
 
   pc.onStateChange(state => {
+    console.log(`[rtc:agent] stateChange=${state} ch=${channelId}`);
     if (state === 'failed' || state === 'closed') handlePcFailed(channelId);
   });
 
@@ -128,11 +137,13 @@ function createPeerConnection(channelId, sessionName) {
 
 function handleRtcOffer(msg) {
   const { channelId, sessionName, sdp, iceRestart, oldChannelId } = msg;
+  console.log(`[rtc:agent] offer received ch=${channelId} session=${sessionName} iceRestart=${!!iceRestart}`);
 
   // ICE restart: reuse existing PC under the new channelId
   if (iceRestart && oldChannelId) {
     const existing = peerConnections.get(oldChannelId);
     if (existing) {
+      console.log(`[rtc:agent] ICE restart: remapping ${oldChannelId} → ${channelId}`);
       peerConnections.delete(oldChannelId);
       existing.channelId = channelId;
       peerConnections.set(channelId, existing);
