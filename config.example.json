@@ -6,5 +6,6 @@
   "reconnect": {
     "initialDelay": 1000,
     "maxDelay": 30000
-  }
+  },
+  "iceServers": ["stun:stun.l.google.com:19302"]
 }

@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
+const nodeDataChannel = require('node-datachannel');
 const ptyManager = require('./ptyManager');
 const { runSetup } = require('./setup');
 
@@ -24,32 +25,20 @@ function applyEnvOverrides(cfg) {
     managedOnly: managedOnlyEnv !== undefined
       ? managedOnlyEnv === 'true' || managedOnlyEnv === '1'
       : (cfg.managedOnly ?? false),
+    iceServers:  cfg.iceServers ?? ['stun:stun.l.google.com:19302'],
   };
 }
 
 let config;
 
-// ── Binary frame helpers (must match hub/router.js) ───────────────────────────
-
-const CHANNEL_ID_BYTES = 16;
-
-function encodeChannelId(id) {
-  const buf = Buffer.alloc(CHANNEL_ID_BYTES, 0);
-  buf.write(id, 0, 'ascii');
-  return buf;
-}
-
-function decodeChannelId(buf) {
-  return buf.slice(0, CHANNEL_ID_BYTES).toString('ascii').replace(/\0+$/, '');
-}
-
 // ── State ─────────────────────────────────────────────────────────────────────
-
-// channelId → { pty, sessionName }
-const channels = new Map();
 
 let ws = null;
 let reconnectDelay = 1000;
+
+// channelId → { pc, dc, ptyInstance, sessionName, channelId }
+// channelId field mirrors the key so callbacks can read the current id after ICE restart remap
+const peerConnections = new Map();
 
 // ── Hub HTTP calls ─────────────────────────────────────────────────────────────
 
@@ -91,14 +80,10 @@ function buildWsUrl(token) {
   return u.toString();
 }
 
-// ── Send helpers ───────────────────────────────────────────────────────────────
+// ── Send helper ────────────────────────────────────────────────────────────────
 
 function send(msg) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
-}
-
-function sendBinary(data) {
-  if (ws?.readyState === WebSocket.OPEN) ws.send(data, { binary: true });
 }
 
 function reply(requestId, payload) {
@@ -109,55 +94,147 @@ function sendSessions() {
   send({ type: 'sessions', list: ptyManager.listSessions(config.managedOnly) });
 }
 
-// ── Message handlers ───────────────────────────────────────────────────────────
+// ── WebRTC ────────────────────────────────────────────────────────────────────
 
-function handleAttach(msg) {
-  const { requestId, channelId, sessionName, cols, rows } = msg;
+function createPeerConnection(channelId, sessionName) {
+  const pc = new nodeDataChannel.PeerConnection('webmux-agent', {
+    iceServers: config.iceServers,
+  });
+
+  const entry = { pc, dc: null, ptyInstance: null, sessionName, channelId };
+  peerConnections.set(channelId, entry);
+
+  pc.onLocalDescription((sdp, type) => {
+    if (type === 'answer') send({ type: 'rtc-answer', channelId: entry.channelId, sdp });
+  });
+
+  pc.onLocalCandidate((candidate, mid) => {
+    send({ type: 'rtc-ice', channelId: entry.channelId, candidate: { candidate, sdpMid: mid } });
+  });
+
+  pc.onDataChannel(dc => {
+    entry.dc = dc;
+    dc.onMessage(data => handleDcMessage(channelId, data));
+    dc.onClosed(() => handleDcClose(channelId));
+    dc.onError(e => console.error(`DataChannel error [${channelId}]:`, e));
+  });
+
+  pc.onStateChange(state => {
+    if (state === 'failed' || state === 'closed') handlePcFailed(channelId);
+  });
+
+  return entry;
+}
+
+function handleRtcOffer(msg) {
+  const { channelId, sessionName, sdp, iceRestart, oldChannelId } = msg;
+
+  // ICE restart: reuse existing PC under the new channelId
+  if (iceRestart && oldChannelId) {
+    const existing = peerConnections.get(oldChannelId);
+    if (existing) {
+      peerConnections.delete(oldChannelId);
+      existing.channelId = channelId;
+      peerConnections.set(channelId, existing);
+      existing.pc.setRemoteDescription(sdp, 'offer');
+      return;
+    }
+  }
+
+  const entry = createPeerConnection(channelId, sessionName);
+  entry.pc.setRemoteDescription(sdp, 'offer');
+}
+
+function handleRtcIce(msg) {
+  const { channelId, candidate } = msg;
+  const entry = peerConnections.get(channelId);
+  if (!entry || !candidate?.candidate) return;
+  try {
+    entry.pc.addRemoteCandidate(candidate.candidate, candidate.sdpMid || '0');
+  } catch (e) {
+    console.error(`addRemoteCandidate [${channelId}]:`, e.message);
+  }
+}
+
+function handleDcMessage(channelId, data) {
+  const entry = peerConnections.get(channelId);
+  if (!entry) return;
+
+  if (typeof data === 'string') {
+    let msg;
+    try { msg = JSON.parse(data); } catch { return; }
+
+    if (msg.type === 'attach' || msg.type === 'reattach') {
+      attachPty(channelId, msg.sessionName, msg.cols ?? 220, msg.rows ?? 50);
+    } else if (msg.type === 'resize' && entry.ptyInstance) {
+      ptyManager.resizePty(entry.ptyInstance, entry.sessionName, msg.cols, msg.rows);
+    } else if (msg.type === 'detach') {
+      handleDcClose(channelId);
+    }
+  } else {
+    // Binary: keyboard input from browser
+    if (entry.ptyInstance) {
+      const input = Buffer.isBuffer(data) ? data.toString() : String(data);
+      entry.ptyInstance.write(input);
+    }
+  }
+}
+
+function attachPty(channelId, sessionName, cols, rows) {
+  const entry = peerConnections.get(channelId);
+  if (!entry) return;
 
   if (config.managedOnly && !ptyManager.isManaged(sessionName)) {
-    reply(requestId, { ok: false, error: 'Session not managed by webmux' });
+    entry.dc?.sendMessage(JSON.stringify({ type: 'error', message: 'Session not managed by webmux' }));
     return;
   }
+
+  entry.sessionName = sessionName;
 
   const p = ptyManager.attachPty(
     sessionName,
     data => {
-      // PTY output → prepend channelId and send as binary
-      const idBuf = encodeChannelId(channelId);
-      const payload = Buffer.from(data);
-      sendBinary(Buffer.concat([idBuf, payload]));
+      try {
+        if (entry.dc?.isOpen()) entry.dc.sendMessageBinary(Buffer.from(data));
+      } catch {}
     },
     () => {
-      // PTY exited
-      channels.delete(channelId);
-      send({ type: 'pty-exited', channelId });
+      // PTY exited (tmux session detached/ended)
+      try {
+        if (entry.dc?.isOpen()) entry.dc.sendMessage(JSON.stringify({ type: 'detached' }));
+      } catch {}
+      closePeerConnection(channelId);
     },
-    cols,
-    rows
+    cols, rows
   );
 
   if (!p) {
-    reply(requestId, { ok: false, error: 'Session not found' });
+    entry.dc?.sendMessage(JSON.stringify({ type: 'error', message: 'Session not found' }));
     return;
   }
 
-  channels.set(channelId, { pty: p, sessionName });
-  reply(requestId, { ok: true });
+  entry.ptyInstance = p;
+  entry.dc?.sendMessage(JSON.stringify({ type: 'attached' }));
 }
 
-function handleResize(msg) {
-  const { channelId, cols, rows } = msg;
-  const ch = channels.get(channelId);
-  if (!ch) return;
-  ptyManager.resizePty(ch.pty, ch.sessionName, cols, rows);
+function closePeerConnection(channelId) {
+  const entry = peerConnections.get(channelId);
+  if (!entry) return;
+  peerConnections.delete(channelId);
+  if (entry.ptyInstance) { try { entry.ptyInstance.kill(); } catch {} }
+  try { entry.dc?.close(); } catch {}
+  try { entry.pc?.close(); } catch {}
 }
 
-function handleDetach(msg) {
-  const ch = channels.get(msg.channelId);
-  if (!ch) return;
-  try { ch.pty.kill(); } catch {}
-  channels.delete(msg.channelId);
+function handleDcClose(channelId) {
+  closePeerConnection(channelId);
 }
+
+function handlePcFailed(channelId) {
+  closePeerConnection(channelId);
+}
+
+// ── Session management (forwarded from Hub REST → agent via WS) ────────────────
 
 function handleCreateSession(msg) {
   try {
@@ -188,10 +265,7 @@ function handleKillSession(msg) {
 
 function handleGetCwd(msg) {
   const cwd = ptyManager.getSessionCwd(msg.session);
-  if (!cwd) {
-    reply(msg.requestId, { ok: false, error: 'Cannot get cwd' });
-    return;
-  }
+  if (!cwd) { reply(msg.requestId, { ok: false, error: 'Cannot get cwd' }); return; }
   reply(msg.requestId, { ok: true, cwd });
 }
 
@@ -200,24 +274,15 @@ function handleLs(msg) {
 
   if (!targetPath && msg.session) {
     targetPath = ptyManager.getSessionCwd(msg.session);
-    if (!targetPath) {
-      reply(msg.requestId, { ok: false, error: 'Cannot get session cwd' });
-      return;
-    }
+    if (!targetPath) { reply(msg.requestId, { ok: false, error: 'Cannot get session cwd' }); return; }
   }
 
-  if (!targetPath) {
-    reply(msg.requestId, { ok: false, error: 'path or session required' });
-    return;
-  }
+  if (!targetPath) { reply(msg.requestId, { ok: false, error: 'path or session required' }); return; }
 
   const resolved = path.resolve(targetPath);
   try {
     const stat = fs.statSync(resolved);
-    if (!stat.isDirectory()) {
-      reply(msg.requestId, { ok: false, error: 'Not a directory' });
-      return;
-    }
+    if (!stat.isDirectory()) { reply(msg.requestId, { ok: false, error: 'Not a directory' }); return; }
     const items = fs.readdirSync(resolved, { withFileTypes: true })
       .map(e => ({ name: e.name, isDir: e.isDirectory() }))
       .sort((a, b) => {
@@ -225,7 +290,7 @@ function handleLs(msg) {
         return a.name.localeCompare(b.name);
       });
     reply(msg.requestId, { ok: true, path: resolved, items });
-  } catch (e) {
+  } catch {
     reply(msg.requestId, { ok: false, error: 'Cannot read directory' });
   }
 }
@@ -234,17 +299,9 @@ function handleDownload(msg) {
   const resolved = path.resolve(msg.path);
   try {
     const stat = fs.statSync(resolved);
-    if (!stat.isFile()) {
-      reply(msg.requestId, { ok: false, error: 'Not a file' });
-      return;
-    }
+    if (!stat.isFile()) { reply(msg.requestId, { ok: false, error: 'Not a file' }); return; }
     const data = fs.readFileSync(resolved).toString('base64');
-    reply(msg.requestId, {
-      ok: true,
-      filename: path.basename(resolved),
-      size: stat.size,
-      data,
-    });
+    reply(msg.requestId, { ok: true, filename: path.basename(resolved), size: stat.size, data });
   } catch {
     reply(msg.requestId, { ok: false, error: 'File not found' });
   }
@@ -252,20 +309,11 @@ function handleDownload(msg) {
 
 function handleUpload(msg) {
   const cwd = ptyManager.getSessionCwd(msg.session);
-  if (!cwd) {
-    reply(msg.requestId, { ok: false, error: 'Cannot get session cwd' });
-    return;
-  }
+  if (!cwd) { reply(msg.requestId, { ok: false, error: 'Cannot get session cwd' }); return; }
 
   if (!msg.overwrite) {
-    const conflicts = msg.files
-      .map(f => f.filename)
-      .filter(name => fs.existsSync(path.join(cwd, name)));
-
-    if (conflicts.length > 0) {
-      reply(msg.requestId, { ok: false, error: 'conflict', conflicts });
-      return;
-    }
+    const conflicts = msg.files.map(f => f.filename).filter(name => fs.existsSync(path.join(cwd, name)));
+    if (conflicts.length > 0) { reply(msg.requestId, { ok: false, error: 'conflict', conflicts }); return; }
   }
 
   try {
@@ -284,31 +332,21 @@ function handleUpload(msg) {
 // ── Dispatch ───────────────────────────────────────────────────────────────────
 
 function handleMessage(data, isBinary) {
-  if (isBinary) {
-    // Keyboard input from Hub: [channelId 16B][payload]
-    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    if (buf.length <= CHANNEL_ID_BYTES) return;
-    const channelId = decodeChannelId(buf);
-    const payload = buf.slice(CHANNEL_ID_BYTES);
-    const ch = channels.get(channelId);
-    if (ch) ch.pty.write(payload.toString());
-    return;
-  }
+  if (isBinary) return;
 
   let msg;
   try { msg = JSON.parse(data); } catch { return; }
 
   switch (msg.type) {
-    case 'attach':         handleAttach(msg); break;
-    case 'resize':         handleResize(msg); break;
-    case 'detach':         handleDetach(msg); break;
-    case 'create-session': handleCreateSession(msg); break;
-    case 'rename-session': handleRenameSession(msg); break;
-    case 'kill-session':   handleKillSession(msg); break;
-    case 'get-cwd':        handleGetCwd(msg); break;
-    case 'ls':             handleLs(msg); break;
-    case 'download':       handleDownload(msg); break;
-    case 'upload':         handleUpload(msg); break;
+    case 'rtc-offer':       handleRtcOffer(msg); break;
+    case 'rtc-ice':         handleRtcIce(msg); break;
+    case 'create-session':  handleCreateSession(msg); break;
+    case 'rename-session':  handleRenameSession(msg); break;
+    case 'kill-session':    handleKillSession(msg); break;
+    case 'get-cwd':         handleGetCwd(msg); break;
+    case 'ls':              handleLs(msg); break;
+    case 'download':        handleDownload(msg); break;
+    case 'upload':          handleUpload(msg); break;
   }
 }
 
@@ -335,9 +373,8 @@ function connect() {
 
       ws.on('close', (code, reason) => {
         console.log(`Disconnected from Hub (${code} ${reason}).`);
-        // Clean up all active channels
-        channels.forEach(ch => { try { ch.pty.kill(); } catch {} });
-        channels.clear();
+        // Close all active peer connections — browsers will detect via WebRTC state
+        for (const channelId of [...peerConnections.keys()]) closePeerConnection(channelId);
         scheduleReconnect();
       });
 
