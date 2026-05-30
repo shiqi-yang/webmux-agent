@@ -120,8 +120,9 @@ function createPeerConnection(channelId, sessionName) {
   pc.onGatheringStateChange(state => {
     console.log(`[rtc:agent] gatheringState=${state} ch=${channelId}`);
     if (state === 'complete') {
-      // Send the final answer SDP which now includes all gathered candidates
-      const sdp = pc.localDescription();
+      // localDescription() returns { type, sdp } — extract the SDP string
+      const desc = pc.localDescription();
+      const sdp = typeof desc === 'string' ? desc : desc?.sdp;
       if (sdp) {
         console.log(`[rtc:agent] sending complete answer ch=${entry.channelId}`);
         send({ type: 'rtc-answer', channelId: entry.channelId, sdp });
