@@ -25,7 +25,9 @@ function applyEnvOverrides(cfg) {
     managedOnly: managedOnlyEnv !== undefined
       ? managedOnlyEnv === 'true' || managedOnlyEnv === '1'
       : (cfg.managedOnly ?? false),
-    iceServers:  cfg.iceServers ?? ['stun:stun.l.google.com:19302'],
+    iceServers:     cfg.iceServers     ?? ['stun:stun.l.google.com:19302'],
+    portRangeBegin: cfg.portRangeBegin ?? undefined,
+    portRangeEnd:   cfg.portRangeEnd   ?? undefined,
   };
 }
 
@@ -97,25 +99,34 @@ function sendSessions() {
 // ── WebRTC ────────────────────────────────────────────────────────────────────
 
 function createPeerConnection(channelId, sessionName) {
-  const pc = new nodeDataChannel.PeerConnection('webmux-agent', {
-    iceServers: config.iceServers,
-  });
+  const pcConfig = { iceServers: config.iceServers };
+  if (config.portRangeBegin) pcConfig.portRangeBegin = config.portRangeBegin;
+  if (config.portRangeEnd)   pcConfig.portRangeEnd   = config.portRangeEnd;
+
+  const pc = new nodeDataChannel.PeerConnection('webmux-agent', pcConfig);
 
   const entry = { pc, dc: null, ptyInstance: null, sessionName, channelId };
   peerConnections.set(channelId, entry);
 
   pc.onLocalDescription((sdp, type) => {
-    console.log(`[rtc:agent] localDescription type=${type} ch=${entry.channelId}`);
-    if (type === 'answer') send({ type: 'rtc-answer', channelId: entry.channelId, sdp });
+    // Don't send yet — wait for gathering complete so srflx candidates are bundled in the SDP
+    console.log(`[rtc:agent] localDescription type=${type} ch=${entry.channelId} (waiting for gathering)`);
   });
 
   pc.onLocalCandidate((candidate, mid) => {
     console.log(`[rtc:agent] localCandidate ch=${entry.channelId} mid=${mid} ${candidate.slice(0, 60)}`);
-    send({ type: 'rtc-ice', channelId: entry.channelId, candidate: { candidate, sdpMid: mid } });
   });
 
   pc.onGatheringStateChange(state => {
     console.log(`[rtc:agent] gatheringState=${state} ch=${channelId}`);
+    if (state === 'complete') {
+      // Send the final answer SDP which now includes all gathered candidates
+      const sdp = pc.localDescription();
+      if (sdp) {
+        console.log(`[rtc:agent] sending complete answer ch=${entry.channelId}`);
+        send({ type: 'rtc-answer', channelId: entry.channelId, sdp });
+      }
+    }
   });
 
   pc.onDataChannel(dc => {

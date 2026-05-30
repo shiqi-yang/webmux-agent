@@ -7,5 +7,7 @@
     "initialDelay": 1000,
     "maxDelay": 30000
   },
-  "iceServers": ["stun:stun.l.google.com:19302"]
+  "iceServers": ["stun:stun.l.google.com:19302"],
+  "portRangeBegin": 40000,
+  "portRangeEnd": 40200
 }
