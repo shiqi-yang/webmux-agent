@@ -58,7 +58,12 @@ function printBanner() {
 }
 
 function printCfg(cfg) {
-  console.log(`    Hub URL      ${cfg.hubUrl}`);
+  if (cfg.hohUrl) {
+    console.log(`    Hub of Hubs  ${cfg.hohUrl}`);
+  } else {
+    const urls = Array.isArray(cfg.hubUrls) ? cfg.hubUrls.join(', ') : (cfg.hubUrl ?? '');
+    console.log(`    Hub URL(s)   ${urls}`);
+  }
   console.log(`    Username     ${cfg.username}`);
   console.log(`    Password     ${'*'.repeat(cfg.password?.length ?? 0)}`);
   console.log(`    Managed only ${cfg.managedOnly ?? false}`);
@@ -68,12 +73,22 @@ function printCfg(cfg) {
 // ── Interactive prompts ───────────────────────────────────────────────────────
 
 async function promptAll(defaults) {
-  const hubUrl   = await ask('Hub URL      ', defaults.hubUrl   ?? 'https://');
+  const hohUrl   = await ask('Hub of Hubs  ', defaults.hohUrl ?? '');
+
+  // Only ask for direct hub URLs if no HoH is specified
+  let hubUrls = defaults.hubUrls ?? (defaults.hubUrl ? [defaults.hubUrl] : []);
+  if (!hohUrl) {
+    const existingUrls = hubUrls.join(',') || 'https://';
+    const raw = await ask('Hub URL(s)   ', existingUrls);
+    hubUrls = raw.split(',').map(s => s.trim().replace(/\/$/, '')).filter(Boolean);
+  }
+
   const username = await ask('Username     ', defaults.username ?? '');
   const password = await ask('Password     ', defaults.password ?? '', true);
   const moRaw    = await ask('Managed only (y/N)', defaults.managedOnly ? 'y' : 'N');
+
   return {
-    hubUrl:      hubUrl.replace(/\/$/, ''),
+    ...(hohUrl ? { hohUrl: hohUrl.replace(/\/$/, '') } : { hubUrls }),
     username,
     password,
     managedOnly: moRaw.trim().toLowerCase() === 'y',
@@ -91,7 +106,10 @@ async function runSetup(configPath) {
     try { existing = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
   }
 
-  const complete = existing?.hubUrl && existing?.username && existing?.password;
+  const hasHubUrl = existing?.hohUrl ||
+    existing?.hubUrl ||
+    (Array.isArray(existing?.hubUrls) && existing.hubUrls.length > 0);
+  const complete = hasHubUrl && existing?.username && existing?.password;
 
   if (complete) {
     console.log('  Current configuration:\n');
@@ -108,8 +126,8 @@ async function runSetup(configPath) {
 
   const cfg = await promptAll(existing ?? {});
 
-  if (!cfg.hubUrl || !cfg.username || !cfg.password) {
-    console.error('\n  Error: hubUrl, username, and password are required.\n');
+  if ((!cfg.hohUrl && !cfg.hubUrls?.length) || !cfg.username || !cfg.password) {
+    console.error('\n  Error: hohUrl (or hubUrls), username, and password are required.\n');
     process.exit(1);
   }
 

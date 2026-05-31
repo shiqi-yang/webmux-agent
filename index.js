@@ -1,7 +1,6 @@
 const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
-const nodeDataChannel = require('node-datachannel');
 const ptyManager = require('./ptyManager');
 const { runSetup } = require('./setup');
 
@@ -15,37 +14,104 @@ function resolveConfigPath() {
   return path.join(__dirname, 'config.json');
 }
 
+function resolveHubUrls(cfg) {
+  if (process.env.HUB_URLS) return process.env.HUB_URLS.split(',').map(s => s.trim()).filter(Boolean);
+  if (process.env.HUB_URL)  return [process.env.HUB_URL.replace(/\/$/, '')];
+  if (Array.isArray(cfg.hubUrls) && cfg.hubUrls.length > 0)
+    return cfg.hubUrls.map(u => u.replace(/\/$/, ''));
+  if (cfg.hubUrl) return [cfg.hubUrl.replace(/\/$/, '')];
+  return [];
+}
+
 function applyEnvOverrides(cfg) {
   const managedOnlyEnv = process.env.MANAGED_ONLY;
   return {
     ...cfg,
-    hubUrl:      (process.env.HUB_URL      || cfg.hubUrl   || '').replace(/\/$/, ''),
-    username:    process.env.AGENT_USERNAME || cfg.username,
-    password:    process.env.AGENT_PASSWORD || cfg.password,
+    hohUrl:      process.env.HOH_URL        || cfg.hohUrl    || null,
+    username:    process.env.AGENT_USERNAME  || cfg.username,
+    password:    process.env.AGENT_PASSWORD  || cfg.password,
     managedOnly: managedOnlyEnv !== undefined
       ? managedOnlyEnv === 'true' || managedOnlyEnv === '1'
       : (cfg.managedOnly ?? false),
-    iceServers:     cfg.iceServers     ?? ['stun:stun.l.google.com:19302'],
-    portRangeBegin: cfg.portRangeBegin ?? undefined,
-    portRangeEnd:   cfg.portRangeEnd   ?? undefined,
+    reconnect: cfg.reconnect ?? { initialDelay: 1000, maxDelay: 30000 },
   };
 }
 
 let config;
+let hubUrls = [];  // fallback static list
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
 let ws = null;
 let reconnectDelay = 1000;
 
-// channelId → { pc, dc, ptyInstance, sessionName, channelId }
-// channelId field mirrors the key so callbacks can read the current id after ICE restart remap
-const peerConnections = new Map();
+// channelId → { ptyInstance, sessionName }
+const channels = new Map();
+
+const CHANNEL_ID_LEN = 16;
+
+// ── Hub discovery & latency selection ─────────────────────────────────────────
+
+// Fetch hub list from Hub of Hubs; fall back to statically configured hubUrls
+async function discoverHubs() {
+  if (config.hohUrl) {
+    try {
+      const res = await fetch(`${config.hohUrl}/hubs`, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const data = await res.json();
+        const urls = (data.hubs ?? []).map(h => h.url).filter(Boolean);
+        if (urls.length > 0) {
+          console.log(`Discovered ${urls.length} hub(s) from HoH at ${config.hohUrl}`);
+          return urls;
+        }
+      }
+    } catch (e) {
+      console.warn(`HoH unreachable (${config.hohUrl}): ${e.message}`);
+    }
+  }
+  if (hubUrls.length > 0) {
+    console.log(`Using ${hubUrls.length} statically configured hub(s)`);
+    return hubUrls;
+  }
+  throw new Error('No hubs available: configure hohUrl or hubUrls');
+}
+
+async function pingHub(url) {
+  const start = Date.now();
+  try {
+    const res = await fetch(`${url}/api/ping`, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return Infinity;
+    return Date.now() - start;
+  } catch {
+    return Infinity;
+  }
+}
+
+async function selectBestHub(urls) {
+  if (urls.length === 1) return urls[0];
+
+  console.log('Testing hub latencies…');
+  const results = await Promise.all(urls.map(async url => {
+    const latency = await pingHub(url);
+    console.log(`  ${url}: ${latency === Infinity ? 'unreachable' : latency + 'ms'}`);
+    return { url, latency };
+  }));
+
+  const reachable = results.filter(r => r.latency < Infinity).sort((a, b) => a.latency - b.latency);
+  if (reachable.length === 0) {
+    console.warn('All hubs unreachable, trying first hub…');
+    return urls[0];
+  }
+
+  const best = reachable[0];
+  console.log(`→ Selected hub: ${best.url} (${best.latency}ms)\n`);
+  return best.url;
+}
 
 // ── Hub HTTP calls ─────────────────────────────────────────────────────────────
 
-async function registerWithHub() {
-  const res = await fetch(`${config.hubUrl}/auth/register`, {
+async function registerWithHub(hubUrl) {
+  const res = await fetch(`${hubUrl}/auth/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username: config.username, password: config.password }),
@@ -60,8 +126,8 @@ async function registerWithHub() {
   }
 }
 
-async function loginToHub() {
-  const res = await fetch(`${config.hubUrl}/auth/login`, {
+async function loginToHub(hubUrl) {
+  const res = await fetch(`${hubUrl}/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username: config.username, password: config.password }),
@@ -74,15 +140,15 @@ async function loginToHub() {
   return token;
 }
 
-function buildWsUrl(token) {
-  const u = new URL(config.hubUrl);
+function buildWsUrl(hubUrl, token) {
+  const u = new URL(hubUrl);
   u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
   u.pathname = '/agent-ws';
   u.searchParams.set('token', token);
   return u.toString();
 }
 
-// ── Send helper ────────────────────────────────────────────────────────────────
+// ── Send helpers ───────────────────────────────────────────────────────────────
 
 function send(msg) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
@@ -96,165 +162,53 @@ function sendSessions() {
   send({ type: 'sessions', list: ptyManager.listSessions(config.managedOnly) });
 }
 
-// ── WebRTC ────────────────────────────────────────────────────────────────────
-
-function createPeerConnection(channelId, sessionName) {
-  const pcConfig = { iceServers: config.iceServers };
-  if (config.portRangeBegin) pcConfig.portRangeBegin = config.portRangeBegin;
-  if (config.portRangeEnd)   pcConfig.portRangeEnd   = config.portRangeEnd;
-
-  const pc = new nodeDataChannel.PeerConnection('webmux-agent', pcConfig);
-
-  const entry = { pc, dc: null, ptyInstance: null, sessionName, channelId };
-  peerConnections.set(channelId, entry);
-
-  pc.onLocalDescription((sdp, type) => {
-    // Don't send yet — wait for gathering complete so srflx candidates are bundled in the SDP
-    console.log(`[rtc:agent] localDescription type=${type} ch=${entry.channelId} (waiting for gathering)`);
-  });
-
-  pc.onLocalCandidate((candidate, mid) => {
-    console.log(`[rtc:agent] localCandidate ch=${entry.channelId} mid=${mid} ${candidate.slice(0, 60)}`);
-  });
-
-  pc.onGatheringStateChange(state => {
-    console.log(`[rtc:agent] gatheringState=${state} ch=${channelId}`);
-    if (state === 'complete') {
-      // localDescription() returns { type, sdp } — extract the SDP string
-      const desc = pc.localDescription();
-      const sdp = typeof desc === 'string' ? desc : desc?.sdp;
-      if (sdp) {
-        console.log(`[rtc:agent] sending complete answer ch=${entry.channelId}`);
-        send({ type: 'rtc-answer', channelId: entry.channelId, sdp });
-      }
-    }
-  });
-
-  pc.onDataChannel(dc => {
-    console.log(`[rtc:agent] dataChannel received ch=${channelId}`);
-    entry.dc = dc;
-    dc.onOpen(() => console.log(`[rtc:agent] DC open ch=${channelId}`));
-    dc.onMessage(data => handleDcMessage(channelId, data));
-    dc.onClosed(() => { console.log(`[rtc:agent] DC closed ch=${channelId}`); handleDcClose(channelId); });
-    dc.onError(e => console.error(`[rtc:agent] DC error ch=${channelId}:`, e));
-  });
-
-  pc.onStateChange(state => {
-    console.log(`[rtc:agent] stateChange=${state} ch=${channelId}`);
-    if (state === 'failed' || state === 'closed') handlePcFailed(channelId);
-  });
-
-  return entry;
+function sendPtyData(channelId, data) {
+  if (ws?.readyState !== WebSocket.OPEN) return;
+  const idBuf = Buffer.alloc(CHANNEL_ID_LEN);
+  idBuf.write(channelId, 'ascii');
+  ws.send(Buffer.concat([idBuf, Buffer.from(data)]), { binary: true });
 }
 
-function handleRtcOffer(msg) {
-  const { channelId, sessionName, sdp, iceRestart, oldChannelId } = msg;
-  console.log(`[rtc:agent] offer received ch=${channelId} session=${sessionName} iceRestart=${!!iceRestart}`);
+// ── PTY channel management ─────────────────────────────────────────────────────
 
-  // ICE restart: reuse existing PC under the new channelId
-  if (iceRestart && oldChannelId) {
-    const existing = peerConnections.get(oldChannelId);
-    if (existing) {
-      console.log(`[rtc:agent] ICE restart: remapping ${oldChannelId} → ${channelId}`);
-      peerConnections.delete(oldChannelId);
-      existing.channelId = channelId;
-      peerConnections.set(channelId, existing);
-      existing.pc.setRemoteDescription(sdp, 'offer');
-      return;
-    }
-  }
-
-  const entry = createPeerConnection(channelId, sessionName);
-  entry.pc.setRemoteDescription(sdp, 'offer');
-}
-
-function handleRtcIce(msg) {
-  const { channelId, candidate } = msg;
-  const entry = peerConnections.get(channelId);
-  if (!entry || !candidate?.candidate) return;
-  try {
-    entry.pc.addRemoteCandidate(candidate.candidate, candidate.sdpMid || '0');
-  } catch (e) {
-    console.error(`addRemoteCandidate [${channelId}]:`, e.message);
-  }
-}
-
-function handleDcMessage(channelId, data) {
-  const entry = peerConnections.get(channelId);
-  if (!entry) return;
-
-  if (typeof data === 'string') {
-    let msg;
-    try { msg = JSON.parse(data); } catch { return; }
-
-    if (msg.type === 'attach' || msg.type === 'reattach') {
-      attachPty(channelId, msg.sessionName, msg.cols ?? 220, msg.rows ?? 50);
-    } else if (msg.type === 'resize' && entry.ptyInstance) {
-      ptyManager.resizePty(entry.ptyInstance, entry.sessionName, msg.cols, msg.rows);
-    } else if (msg.type === 'detach') {
-      handleDcClose(channelId);
-    }
-  } else {
-    // Binary: keyboard input from browser
-    if (entry.ptyInstance) {
-      const input = Buffer.isBuffer(data) ? data.toString() : String(data);
-      entry.ptyInstance.write(input);
-    }
-  }
-}
-
-function attachPty(channelId, sessionName, cols, rows) {
-  const entry = peerConnections.get(channelId);
-  if (!entry) return;
+function handleAttach(msg) {
+  const { channelId, sessionName, cols, rows } = msg;
 
   if (config.managedOnly && !ptyManager.isManaged(sessionName)) {
-    entry.dc?.sendMessage(JSON.stringify({ type: 'error', message: 'Session not managed by webmux' }));
+    send({ type: 'attach-error', channelId, message: 'Session not managed by webmux' });
     return;
   }
 
-  entry.sessionName = sessionName;
-
   const p = ptyManager.attachPty(
     sessionName,
-    data => {
-      try {
-        if (entry.dc?.isOpen()) entry.dc.sendMessageBinary(Buffer.from(data));
-      } catch {}
-    },
+    data => sendPtyData(channelId, data),
     () => {
-      // PTY exited (tmux session detached/ended)
-      try {
-        if (entry.dc?.isOpen()) entry.dc.sendMessage(JSON.stringify({ type: 'detached' }));
-      } catch {}
-      closePeerConnection(channelId);
+      channels.delete(channelId);
+      send({ type: 'detached', channelId });
     },
     cols, rows
   );
 
   if (!p) {
-    entry.dc?.sendMessage(JSON.stringify({ type: 'error', message: 'Session not found' }));
+    send({ type: 'attach-error', channelId, message: 'Session not found' });
     return;
   }
 
-  entry.ptyInstance = p;
-  entry.dc?.sendMessage(JSON.stringify({ type: 'attached' }));
+  channels.set(channelId, { ptyInstance: p, sessionName });
+  send({ type: 'attached', channelId });
 }
 
-function closePeerConnection(channelId) {
-  const entry = peerConnections.get(channelId);
-  if (!entry) return;
-  peerConnections.delete(channelId);
-  if (entry.ptyInstance) { try { entry.ptyInstance.kill(); } catch {} }
-  try { entry.dc?.close(); } catch {}
-  try { entry.pc?.close(); } catch {}
+function handleResize(msg) {
+  const ch = channels.get(msg.channelId);
+  if (!ch?.ptyInstance) return;
+  ptyManager.resizePty(ch.ptyInstance, ch.sessionName, msg.cols, msg.rows);
 }
 
-function handleDcClose(channelId) {
-  closePeerConnection(channelId);
-}
-
-function handlePcFailed(channelId) {
-  closePeerConnection(channelId);
+function handleDetach(msg) {
+  const ch = channels.get(msg.channelId);
+  if (!ch) return;
+  channels.delete(msg.channelId);
+  try { ch.ptyInstance?.kill(); } catch {}
 }
 
 // ── Session management (forwarded from Hub REST → agent via WS) ────────────────
@@ -355,14 +309,23 @@ function handleUpload(msg) {
 // ── Dispatch ───────────────────────────────────────────────────────────────────
 
 function handleMessage(data, isBinary) {
-  if (isBinary) return;
+  if (isBinary) {
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (buf.length < CHANNEL_ID_LEN) return;
+    const channelId = buf.slice(0, CHANNEL_ID_LEN).toString('ascii');
+    const payload = buf.slice(CHANNEL_ID_LEN);
+    const ch = channels.get(channelId);
+    if (ch?.ptyInstance) ch.ptyInstance.write(payload.toString());
+    return;
+  }
 
   let msg;
   try { msg = JSON.parse(data); } catch { return; }
 
   switch (msg.type) {
-    case 'rtc-offer':       handleRtcOffer(msg); break;
-    case 'rtc-ice':         handleRtcIce(msg); break;
+    case 'attach':          handleAttach(msg); break;
+    case 'resize':          handleResize(msg); break;
+    case 'detach':          handleDetach(msg); break;
     case 'create-session':  handleCreateSession(msg); break;
     case 'rename-session':  handleRenameSession(msg); break;
     case 'kill-session':    handleKillSession(msg); break;
@@ -381,58 +344,60 @@ function scheduleReconnect() {
   reconnectDelay = Math.min(reconnectDelay * 2, config.reconnect.maxDelay);
 }
 
-function connect() {
-  registerAndLogin()
-    .then(token => {
-      ws = new WebSocket(buildWsUrl(token));
+async function connect() {
+  try {
+    const discovered = await discoverHubs();
+    const hubUrl = await selectBestHub(discovered);
 
-      ws.on('open', () => {
-        console.log('Connected to Hub.');
-        reconnectDelay = config.reconnect.initialDelay;
-        sendSessions();
-      });
+    await registerWithHub(hubUrl);
+    const token = await loginToHub(hubUrl);
 
-      ws.on('message', handleMessage);
+    ws = new WebSocket(buildWsUrl(hubUrl, token));
 
-      ws.on('close', (code, reason) => {
-        console.log(`Disconnected from Hub (${code} ${reason}).`);
-        // Close all active peer connections — browsers will detect via WebRTC state
-        for (const channelId of [...peerConnections.keys()]) closePeerConnection(channelId);
-        scheduleReconnect();
-      });
+    ws.on('open', () => {
+      console.log(`Connected to ${hubUrl}`);
+      reconnectDelay = config.reconnect.initialDelay;
+      sendSessions();
+    });
 
-      ws.on('error', err => console.error('WebSocket error:', err.message));
-    })
-    .catch(err => {
-      console.error('Startup error:', err.message);
+    ws.on('message', handleMessage);
+
+    ws.on('close', (code, reason) => {
+      console.log(`Disconnected from Hub (${code} ${reason}).`);
+      for (const [, ch] of channels) try { ch.ptyInstance?.kill(); } catch {}
+      channels.clear();
       scheduleReconnect();
     });
-}
 
-async function registerAndLogin() {
-  await registerWithHub();
-  return loginToHub();
+    ws.on('error', err => console.error('WebSocket error:', err.message));
+  } catch (err) {
+    console.error('Startup error:', err.message);
+    scheduleReconnect();
+  }
 }
 
 // ── Startup ───────────────────────────────────────────────────────────────────
 
 (async () => {
-  const allFromEnv = process.env.HUB_URL && process.env.AGENT_USERNAME && process.env.AGENT_PASSWORD;
+  const allFromEnv = (process.env.HUB_URL || process.env.HUB_URLS) &&
+    process.env.AGENT_USERNAME && process.env.AGENT_PASSWORD;
 
-  if (allFromEnv) {
-    config = applyEnvOverrides({});
-  } else {
-    const fileCfg = await runSetup(resolveConfigPath());
-    config = applyEnvOverrides(fileCfg);
+  let fileCfg = {};
+  if (!allFromEnv) {
+    fileCfg = await runSetup(resolveConfigPath());
   }
 
-  if (!config.hubUrl || !config.username || !config.password) {
-    console.error('Missing required config: hubUrl, username, password');
+  config = applyEnvOverrides(fileCfg);
+  hubUrls = resolveHubUrls(fileCfg);
+
+  if (!config.username || !config.password || (!config.hohUrl && hubUrls.length === 0)) {
+    console.error('Missing required config: hohUrl (or hubUrls), username, password');
     process.exit(1);
   }
 
   reconnectDelay = config.reconnect.initialDelay;
   ptyManager.onSessionChange(sendSessions);
-  console.log(`Starting agent as "${config.username}" → ${config.hubUrl}`);
+  const discoveryInfo = config.hohUrl ? `HoH: ${config.hohUrl}` : `hubs: [${hubUrls.join(', ')}]`;
+  console.log(`Starting agent as "${config.username}" (${discoveryInfo})`);
   connect();
 })();

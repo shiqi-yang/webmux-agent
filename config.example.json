@@ -1,29 +1,10 @@
 {
-  "hubUrl": "https://main.agentscom.top",
+  "hohUrl": "https://hoh.example.com",
   "username": "alice",
   "password": "yourpassword",
   "managedOnly": false,
   "reconnect": {
     "initialDelay": 1000,
     "maxDelay": 30000
-  },
-  "iceServers": [
-    "stun:stun.l.google.com:19302",
-    {
-      "hostname": "your-turn-server.com",
-      "port": 3478,
-      "username": "your-username",
-      "password": "your-password",
-      "relayType": "TurnUdp"
-    },
-    {
-      "hostname": "your-turn-server.com",
-      "port": 443,
-      "username": "your-username",
-      "password": "your-password",
-      "relayType": "TurnTcp"
-    }
-  ],
-  "portRangeBegin": 40000,
-  "portRangeEnd": 40200
+  }
 }

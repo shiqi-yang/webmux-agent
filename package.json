@@ -8,7 +8,6 @@
     "dev": "node --watch index.js"
   },
   "dependencies": {
-    "node-datachannel": "^0.9.0",
     "node-pty": "^1.0.0",
     "ws": "^8.17.1"
   }
