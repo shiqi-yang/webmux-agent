@@ -23,16 +23,16 @@ async function ask(label, defaultVal, hidden) {
     process.stdin.setEncoding('utf8');
 
     function onData(ch) {
-      if (ch === '\r' || ch === '\n' || ch === '') {
+      if (ch === '\r' || ch === '\n' || ch === '\x04') {
         process.stdin.removeListener('data', onData);
         process.stdin.setRawMode(false);
         process.stdin.pause();
         process.stdout.write('\n');
         resolve(buf || defaultVal || '');
-      } else if (ch === '') {
+      } else if (ch === '\x03') {
         process.stdout.write('\n');
         process.exit(0);
-      } else if (ch === '' || ch === '\b') {
+      } else if (ch === '\x7f' || ch === '\b') {
         if (buf.length) {
           buf = buf.slice(0, -1);
           process.stdout.write('\b \b');
