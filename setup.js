@@ -116,7 +116,10 @@ async function runSetup(configPath) {
     printCfg(existing);
     const ans = await ask('Use this configuration? (Y/n)', 'Y');
     console.log();
-    if (ans.trim().toLowerCase() !== 'n') return existing;
+    if (ans.trim().toLowerCase() !== 'n') {
+      fs.writeFileSync(configPath, JSON.stringify(existing, null, 2));
+      return existing;
+    }
     console.log('  Enter new values (press Enter to keep current):\n');
   } else if (existing) {
     console.log('  Incomplete config — please fill in the missing fields:\n');

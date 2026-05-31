@@ -381,10 +381,16 @@ async function connect() {
 (async () => {
   const allFromEnv = (process.env.HUB_URL || process.env.HUB_URLS) &&
     process.env.AGENT_USERNAME && process.env.AGENT_PASSWORD;
+  const noSetup = process.argv.includes('--no-setup') || process.env.SKIP_SETUP === 'true';
 
   let fileCfg = {};
-  if (!allFromEnv) {
+  if (!allFromEnv && !noSetup) {
     fileCfg = await runSetup(resolveConfigPath());
+  } else {
+    const cfgPath = resolveConfigPath();
+    if (fs.existsSync(cfgPath)) {
+      try { fileCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')); } catch {}
+    }
   }
 
   config = applyEnvOverrides(fileCfg);
