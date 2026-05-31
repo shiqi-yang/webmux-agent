@@ -1,3 +1,5 @@
+if (!globalThis.fetch) globalThis.fetch = require('node-fetch');
+
 const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
