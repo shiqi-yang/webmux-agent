@@ -1,10 +1,17 @@
 {
-  "hohUrl": "https://hoh.example.com",
+  "hubUrl": "https://hub.example.com",
   "username": "alice",
   "password": "yourpassword",
   "managedOnly": false,
   "reconnect": {
     "initialDelay": 1000,
     "maxDelay": 30000
-  }
+  },
+  "turnServers": [
+    {
+      "urls": "turn:your-turn-server:3478",
+      "username": "webmux",
+      "credential": "your-turn-password"
+    }
+  ]
 }
