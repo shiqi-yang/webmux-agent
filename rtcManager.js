@@ -42,7 +42,6 @@ function handleOffer(msg, turnServers, sendToHub) {
   if (existing?.pc) {
     try {
       existing.pc.setRemoteDescription(sdp, 'offer');
-      existing.pc.setLocalDescription('answer');
       return;
     } catch {
       cleanup(channelId);
@@ -85,7 +84,6 @@ function handleOffer(msg, turnServers, sendToHub) {
 
   try {
     pc.setRemoteDescription(sdp, 'offer');
-    pc.setLocalDescription('answer');
   } catch (e) {
     sendToHub({ type: 'rtc-failed', channelId, reason: e.message });
     cleanup(channelId);
