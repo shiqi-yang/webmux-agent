@@ -197,7 +197,14 @@ function handleLs(msg) {
     const stat = fs.statSync(resolved);
     if (!stat.isDirectory()) { reply(msg.requestId, { ok: false, error: 'Not a directory' }); return; }
     const items = fs.readdirSync(resolved, { withFileTypes: true })
-      .map(e => ({ name: e.name, isDir: e.isDirectory() }))
+      .map(e => {
+        const isDir = e.isDirectory();
+        let size;
+        if (!isDir) {
+          try { size = fs.statSync(path.join(resolved, e.name)).size; } catch {}
+        }
+        return { name: e.name, isDir, size };
+      })
       .sort((a, b) => {
         if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
         return a.name.localeCompare(b.name);
@@ -221,18 +228,22 @@ function handleDownload(msg) {
 }
 
 function handleUpload(msg) {
-  const cwd = ptyManager.getSessionCwd(msg.session);
-  if (!cwd) { reply(msg.requestId, { ok: false, error: 'Cannot get session cwd' }); return; }
+  let destDir = msg.targetPath;
+  if (!destDir) {
+    destDir = ptyManager.getSessionCwd(msg.session);
+    if (!destDir) { reply(msg.requestId, { ok: false, error: 'Cannot get session cwd' }); return; }
+  }
+  destDir = path.resolve(destDir);
 
   if (!msg.overwrite) {
-    const conflicts = msg.files.map(f => f.filename).filter(name => fs.existsSync(path.join(cwd, name)));
+    const conflicts = msg.files.map(f => f.filename).filter(name => fs.existsSync(path.join(destDir, name)));
     if (conflicts.length > 0) { reply(msg.requestId, { ok: false, error: 'conflict', conflicts }); return; }
   }
 
   try {
     const saved = [];
     for (const file of msg.files) {
-      const dest = path.join(cwd, file.filename);
+      const dest = path.join(destDir, file.filename);
       fs.writeFileSync(dest, Buffer.from(file.data, 'base64'));
       saved.push(dest);
     }
