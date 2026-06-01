@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
 const ptyManager = require('./ptyManager');
+const rtcManager = require('./rtcManager');
 const { runSetup } = require('./setup');
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -16,20 +17,11 @@ function resolveConfigPath() {
   return path.join(__dirname, 'config.json');
 }
 
-function resolveHubUrls(cfg) {
-  if (process.env.HUB_URLS) return process.env.HUB_URLS.split(',').map(s => s.trim()).filter(Boolean);
-  if (process.env.HUB_URL)  return [process.env.HUB_URL.replace(/\/$/, '')];
-  if (Array.isArray(cfg.hubUrls) && cfg.hubUrls.length > 0)
-    return cfg.hubUrls.map(u => u.replace(/\/$/, ''));
-  if (cfg.hubUrl) return [cfg.hubUrl.replace(/\/$/, '')];
-  return [];
-}
-
 function applyEnvOverrides(cfg) {
   const managedOnlyEnv = process.env.MANAGED_ONLY;
   return {
     ...cfg,
-    hohUrl:      process.env.HOH_URL        || cfg.hohUrl    || null,
+    hubUrl:      (process.env.HUB_URL || cfg.hubUrl || '').replace(/\/$/, ''),
     username:    process.env.AGENT_USERNAME  || cfg.username,
     password:    process.env.AGENT_PASSWORD  || cfg.password,
     managedOnly: managedOnlyEnv !== undefined
@@ -40,7 +32,7 @@ function applyEnvOverrides(cfg) {
 }
 
 let config;
-let hubUrls = [];  // fallback static list
+let TURN_SERVERS = [];
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -51,64 +43,6 @@ let reconnectDelay = 1000;
 const channels = new Map();
 
 const CHANNEL_ID_LEN = 16;
-
-// ── Hub discovery & latency selection ─────────────────────────────────────────
-
-// Fetch hub list from Hub of Hubs; fall back to statically configured hubUrls
-async function discoverHubs() {
-  if (config.hohUrl) {
-    try {
-      const res = await fetch(`${config.hohUrl}/hubs`, { signal: AbortSignal.timeout(5000) });
-      if (res.ok) {
-        const data = await res.json();
-        const urls = (data.hubs ?? []).map(h => h.url).filter(Boolean);
-        if (urls.length > 0) {
-          console.log(`Discovered ${urls.length} hub(s) from HoH at ${config.hohUrl}`);
-          return urls;
-        }
-      }
-    } catch (e) {
-      console.warn(`HoH unreachable (${config.hohUrl}): ${e.message}`);
-    }
-  }
-  if (hubUrls.length > 0) {
-    console.log(`Using ${hubUrls.length} statically configured hub(s)`);
-    return hubUrls;
-  }
-  throw new Error('No hubs available: configure hohUrl or hubUrls');
-}
-
-async function pingHub(url) {
-  const start = Date.now();
-  try {
-    const res = await fetch(`${url}/api/ping`, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) return Infinity;
-    return Date.now() - start;
-  } catch {
-    return Infinity;
-  }
-}
-
-async function selectBestHub(urls) {
-  if (urls.length === 1) return urls[0];
-
-  console.log('Testing hub latencies…');
-  const results = await Promise.all(urls.map(async url => {
-    const latency = await pingHub(url);
-    console.log(`  ${url}: ${latency === Infinity ? 'unreachable' : latency + 'ms'}`);
-    return { url, latency };
-  }));
-
-  const reachable = results.filter(r => r.latency < Infinity).sort((a, b) => a.latency - b.latency);
-  if (reachable.length === 0) {
-    console.warn('All hubs unreachable, trying first hub…');
-    return urls[0];
-  }
-
-  const best = reachable[0];
-  console.log(`→ Selected hub: ${best.url} (${best.latency}ms)\n`);
-  return best.url;
-}
 
 // ── Hub HTTP calls ─────────────────────────────────────────────────────────────
 
@@ -213,7 +147,7 @@ function handleDetach(msg) {
   try { ch.ptyInstance?.kill(); } catch {}
 }
 
-// ── Session management (forwarded from Hub REST → agent via WS) ────────────────
+// ── Session management ─────────────────────────────────────────────────────────
 
 function handleCreateSession(msg) {
   try {
@@ -335,6 +269,8 @@ function handleMessage(data, isBinary) {
     case 'ls':              handleLs(msg); break;
     case 'download':        handleDownload(msg); break;
     case 'upload':          handleUpload(msg); break;
+    case 'rtc-offer':       rtcManager.handleOffer(msg, TURN_SERVERS, payload => send(payload)); break;
+    case 'rtc-ice':         rtcManager.handleIce(msg.channelId, msg.candidate, msg.mid); break;
   }
 }
 
@@ -348,9 +284,7 @@ function scheduleReconnect() {
 
 async function connect() {
   try {
-    const discovered = await discoverHubs();
-    const hubUrl = await selectBestHub(discovered);
-
+    const { hubUrl } = config;
     await registerWithHub(hubUrl);
     const token = await loginToHub(hubUrl);
 
@@ -381,8 +315,7 @@ async function connect() {
 // ── Startup ───────────────────────────────────────────────────────────────────
 
 (async () => {
-  const allFromEnv = (process.env.HUB_URL || process.env.HUB_URLS) &&
-    process.env.AGENT_USERNAME && process.env.AGENT_PASSWORD;
+  const allFromEnv = process.env.HUB_URL && process.env.AGENT_USERNAME && process.env.AGENT_PASSWORD;
   const noSetup = process.argv.includes('--no-setup') || process.env.SKIP_SETUP === 'true';
 
   let fileCfg = {};
@@ -396,16 +329,16 @@ async function connect() {
   }
 
   config = applyEnvOverrides(fileCfg);
-  hubUrls = resolveHubUrls(fileCfg);
 
-  if (!config.username || !config.password || (!config.hohUrl && hubUrls.length === 0)) {
-    console.error('Missing required config: hohUrl (or hubUrls), username, password');
+  if (!config.username || !config.password || !config.hubUrl) {
+    console.error('Missing required config: hubUrl, username, password');
     process.exit(1);
   }
 
+  TURN_SERVERS = JSON.parse(process.env.TURN_SERVERS || JSON.stringify(fileCfg.turnServers || []));
+
   reconnectDelay = config.reconnect.initialDelay;
   ptyManager.onSessionChange(sendSessions);
-  const discoveryInfo = config.hohUrl ? `HoH: ${config.hohUrl}` : `hubs: [${hubUrls.join(', ')}]`;
-  console.log(`Starting agent as "${config.username}" (${discoveryInfo})`);
+  console.log(`Starting agent as "${config.username}" (hub: ${config.hubUrl})`);
   connect();
 })();
