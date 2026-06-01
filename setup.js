@@ -62,10 +62,23 @@ function printCfg(cfg) {
   console.log(`    Username     ${cfg.username}`);
   console.log(`    Password     ${'*'.repeat(cfg.password?.length ?? 0)}`);
   console.log(`    Managed only ${cfg.managedOnly ?? false}`);
+  const turn = cfg.turnServers?.[0];
+  console.log(`    TURN server  ${turn ? turn.urls : '(none)'}`);
+  if (turn?.username) console.log(`    TURN user    ${turn.username}`);
   console.log();
 }
 
 // ── Interactive prompts ───────────────────────────────────────────────────────
+
+async function promptTurn(defaults) {
+  const existing = defaults.turnServers?.[0];
+  console.log('  TURN server (leave blank to disable WebRTC relay):');
+  const turnUrl  = await ask('  URL          ', existing?.urls ?? '');
+  if (!turnUrl.trim()) return [];
+  const username   = await ask('  Username     ', existing?.username ?? '');
+  const credential = await ask('  Credential   ', existing?.credential ?? '', true);
+  return [{ urls: turnUrl.trim(), username: username.trim(), credential: credential.trim() }];
+}
 
 async function promptAll(defaults) {
   const existingUrl = defaults.hubUrl ?? '';
@@ -75,6 +88,7 @@ async function promptAll(defaults) {
   const username = await ask('Username     ', defaults.username ?? '');
   const password = await ask('Password     ', defaults.password ?? '', true);
   const moRaw    = await ask('Managed only (y/N)', defaults.managedOnly ? 'y' : 'N');
+  const turnServers = await promptTurn(defaults);
 
   return {
     hubUrl,
@@ -82,6 +96,7 @@ async function promptAll(defaults) {
     password,
     managedOnly: moRaw.trim().toLowerCase() === 'y',
     reconnect:   defaults.reconnect ?? { initialDelay: 1000, maxDelay: 30000 },
+    ...(turnServers.length > 0 ? { turnServers } : {}),
   };
 }
 
