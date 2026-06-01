@@ -340,5 +340,8 @@ async function connect() {
   reconnectDelay = config.reconnect.initialDelay;
   ptyManager.onSessionChange(sendSessions);
   console.log(`Starting agent as "${config.username}" (hub: ${config.hubUrl})`);
+  if (!rtcManager.isWebRtcAvailable()) {
+    console.error('\x1b[41m\x1b[1m\x1b[37m  ✗  WebRTC 不可用：node-datachannel 未安装，运行 npm install 修复  \x1b[0m');
+  }
   connect();
 })();

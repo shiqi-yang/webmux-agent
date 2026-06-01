@@ -4,8 +4,12 @@ let NodeDataChannel;
 try {
   NodeDataChannel = require('node-datachannel');
 } catch {
-  console.warn('[rtc] node-datachannel not available — WebRTC disabled');
+  console.error('\x1b[41m\x1b[1m\x1b[37m');
+  console.error('  ✗  node-datachannel 未安装，WebRTC 功能不可用！                    ');
+  console.error('     请运行: npm install                                              ');
+  console.error('\x1b[0m');
 }
+
 
 const ptyManager = require('./ptyManager');
 
@@ -198,4 +202,4 @@ function cleanup(channelId) {
   }
 }
 
-module.exports = { handleOffer, handleIce, cleanup };
+module.exports = { handleOffer, handleIce, cleanup, isWebRtcAvailable: () => !!NodeDataChannel };
