@@ -161,11 +161,14 @@ function resizePty(p, sessionName, cols, rows) {
 
 function getSessionCwd(sessionName) {
   try {
-    return execFileSync(
+    // list-panes works without an attached client; display-message may silently
+    // return empty when no client is connected to the session.
+    const out = execFileSync(
       'tmux',
-      ['display-message', '-t', t(sessionName), '-p', '#{pane_current_path}'],
+      ['list-panes', '-t', t(sessionName), '-F', '#{pane_current_path}'],
       { encoding: 'utf8' }
     ).trim();
+    return out.split('\n')[0].trim() || null;
   } catch {
     return null;
   }
