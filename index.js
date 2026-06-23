@@ -293,6 +293,8 @@ function scheduleReconnect() {
   reconnectDelay = Math.min(reconnectDelay * 2, config.reconnect.maxDelay);
 }
 
+const PING_INTERVAL = 25_000;
+
 async function connect() {
   try {
     const { hubUrl } = config;
@@ -300,16 +302,26 @@ async function connect() {
     const token = await loginToHub(hubUrl);
 
     ws = new WebSocket(buildWsUrl(hubUrl, token));
+    let pingTimer = null;
 
     ws.on('open', () => {
       console.log(`Connected to ${hubUrl}`);
       reconnectDelay = config.reconnect.initialDelay;
+      ws.isAlive = true;
+      pingTimer = setInterval(() => {
+        if (!ws.isAlive) { ws.terminate(); return; }
+        ws.isAlive = false;
+        ws.ping();
+      }, PING_INTERVAL);
       sendSessions();
     });
+
+    ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', handleMessage);
 
     ws.on('close', (code, reason) => {
+      clearInterval(pingTimer);
       console.log(`Disconnected from Hub (${code} ${reason}).`);
       for (const [, ch] of channels) try { ch.ptyInstance?.kill(); } catch {}
       channels.clear();
