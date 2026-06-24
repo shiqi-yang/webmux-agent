@@ -182,7 +182,7 @@ function handleGetCwd(msg) {
   reply(msg.requestId, { ok: true, cwd });
 }
 
-function handleLs(msg) {
+async function handleLs(msg) {
   let targetPath = msg.path;
 
   if (!targetPath && msg.session) {
@@ -196,19 +196,19 @@ function handleLs(msg) {
   try {
     const stat = fs.statSync(resolved);
     if (!stat.isDirectory()) { reply(msg.requestId, { ok: false, error: 'Not a directory' }); return; }
-    const items = fs.readdirSync(resolved, { withFileTypes: true })
-      .map(e => {
-        const isDir = e.isDirectory();
-        let size;
-        if (!isDir) {
-          try { size = fs.statSync(path.join(resolved, e.name)).size; } catch {}
-        }
-        return { name: e.name, isDir, size };
-      })
-      .sort((a, b) => {
-        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      });
+    const dirents = fs.readdirSync(resolved, { withFileTypes: true });
+    const items = await Promise.all(dirents.map(async e => {
+      const isDir = e.isDirectory();
+      let size;
+      if (!isDir) {
+        try { size = (await fs.promises.stat(path.join(resolved, e.name))).size; } catch {}
+      }
+      return { name: e.name, isDir, size };
+    }));
+    items.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
     reply(msg.requestId, { ok: true, path: resolved, items });
   } catch {
     reply(msg.requestId, { ok: false, error: 'Cannot read directory' });
@@ -277,7 +277,7 @@ function handleMessage(data, isBinary) {
     case 'rename-session':  handleRenameSession(msg); break;
     case 'kill-session':    handleKillSession(msg); break;
     case 'get-cwd':         handleGetCwd(msg); break;
-    case 'ls':              handleLs(msg); break;
+    case 'ls':              handleLs(msg).catch(() => {}); break;
     case 'download':        handleDownload(msg); break;
     case 'upload':          handleUpload(msg); break;
     case 'rtc-offer':       rtcManager.handleOffer(msg, TURN_SERVERS, payload => send(payload)); break;
