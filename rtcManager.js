@@ -1,5 +1,8 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
+
 let NodeDataChannel;
 try {
   NodeDataChannel = require('node-datachannel');
@@ -12,6 +15,8 @@ try {
 
 
 const ptyManager = require('./ptyManager');
+
+const FILE_CHUNK_SIZE = 65536; // 64 KB per DataChannel frame
 
 // channelId → { pc, sessionName }
 const peers = new Map();
@@ -77,7 +82,11 @@ function handleOffer(msg, turnServers, sendToHub) {
   });
 
   pc.onDataChannel(dc => {
-    bindDataChannelToPty(dc, channelId, sessionName, sendToHub);
+    if (dc.getLabel().startsWith('file-')) {
+      bindDataChannelToFile(dc);
+    } else {
+      bindDataChannelToPty(dc, channelId, sessionName, sendToHub);
+    }
   });
 
   pc.onStateChange(state => {
@@ -100,6 +109,50 @@ function handleIce(channelId, candidate, mid) {
   try {
     entry.pc.addRemoteCandidate(candidate, mid);
   } catch {}
+}
+
+// ── File transfer DataChannel ─────────────────────────────────────────────────
+// Protocol (browser → agent): JSON text { type:'file-req', requestId:'<16 hex>', path:'<abs>' }
+// Protocol (agent → browser): binary frames [16B requestId][4B chunkIdx u32BE][4B total u32BE][data]
+//                             or JSON text  { type:'file-err', requestId, error }
+
+function bindDataChannelToFile(dc) {
+  dc.onMessage(data => {
+    if (typeof data !== 'string') return;
+    let msg;
+    try { msg = JSON.parse(data); } catch { return; }
+    if (msg.type !== 'file-req') return;
+
+    const { requestId, path: filePath } = msg;
+    if (typeof requestId !== 'string' || requestId.length !== 16 || !filePath) return;
+
+    const resolved = path.resolve(filePath);
+    let fileData;
+    try {
+      const stat = fs.statSync(resolved);
+      if (!stat.isFile()) {
+        dc.sendMessage(JSON.stringify({ type: 'file-err', requestId, error: 'Not a file' }));
+        return;
+      }
+      fileData = fs.readFileSync(resolved);
+    } catch {
+      dc.sendMessage(JSON.stringify({ type: 'file-err', requestId, error: 'File not found' }));
+      return;
+    }
+
+    const totalChunks = Math.max(1, Math.ceil(fileData.length / FILE_CHUNK_SIZE));
+    const idBuf = Buffer.from(requestId, 'ascii'); // 16 bytes
+
+    for (let i = 0; i < totalChunks; i++) {
+      if (!dc.isOpen()) break;
+      const chunk = fileData.slice(i * FILE_CHUNK_SIZE, (i + 1) * FILE_CHUNK_SIZE);
+      const header = Buffer.allocUnsafe(24);
+      idBuf.copy(header, 0);
+      header.writeUInt32BE(i, 16);
+      header.writeUInt32BE(totalChunks, 20);
+      try { dc.sendMessageBinary(Buffer.concat([header, chunk])); } catch { break; }
+    }
+  });
 }
 
 function bindDataChannelToPty(dc, channelId, initialSessionName, sendToHub) {
