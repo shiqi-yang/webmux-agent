@@ -149,6 +149,8 @@ function attachPty(sessionName, onData, onExit, cols = 220, rows = 50) {
   p.onExit(() => {
     sessionPtys.get(sessionName)?.delete(p);
     onExit();
+    // Session may have been killed externally; notify listeners if it's gone.
+    if (!hasSession(sessionName)) broadcastChange();
   });
 
   return p;
@@ -174,9 +176,25 @@ function getSessionCwd(sessionName) {
   }
 }
 
+// Poll for externally-added or externally-removed tmux sessions.
+// This catches changes that happen outside of webmux (e.g. `tmux kill-session`
+// run directly in the terminal, or a shell exiting with no PTY attached).
+let _pollSnapshot = null;
+
+function startExternalChangePoller(intervalMs = 5000) {
+  _pollSnapshot = JSON.stringify(listSessions());
+  setInterval(() => {
+    const current = JSON.stringify(listSessions());
+    if (current !== _pollSnapshot) {
+      _pollSnapshot = current;
+      broadcastChange();
+    }
+  }, intervalMs);
+}
+
 module.exports = {
   listSessions, hasSession, isManaged,
   createSession, renameSession, killSession,
   attachPty, resizePty, getSessionCwd,
-  onSessionChange,
+  onSessionChange, startExternalChangePoller,
 };
