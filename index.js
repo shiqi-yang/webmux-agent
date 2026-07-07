@@ -1,5 +1,15 @@
 if (!globalThis.fetch) globalThis.fetch = require('node-fetch');
 
+// ── Timestamped logging ──────────────────────────────────────────────────────
+
+['log','error','warn'].forEach(m => {
+  const orig = console[m];
+  console[m] = (...args) => {
+    const ts = new Date().toLocaleString('sv', { hour12: false }).replace('T', ' ');
+    orig(`[${ts}]`, ...args);
+  };
+});
+
 const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
