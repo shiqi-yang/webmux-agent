@@ -305,7 +305,7 @@ function scheduleReconnect() {
   reconnectDelay = Math.min(reconnectDelay * 2, config.reconnect.maxDelay);
 }
 
-const PING_INTERVAL = 25_000;
+const PING_INTERVAL = 15_000;
 
 async function connect() {
   try {
