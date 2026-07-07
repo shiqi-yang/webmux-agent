@@ -158,8 +158,8 @@ function attachPty(sessionName, onData, onExit, cols = 220, rows = 50) {
 
 function resizePty(p, sessionName, cols, rows) {
   try { p.resize(cols, rows); } catch {}
-  // 注释掉：resize-window -x -y 会把 window-size 设为 manual，导致 status bar 覆盖内容末行
-  // execFile('tmux', ['resize-window', '-t', t(sessionName), '-x', String(cols), '-y', String(rows)]);
+  // rows 减 1：status bar 占 1 行，pane 区只需 rows-1
+  execFile('tmux', ['resize-window', '-t', t(sessionName), '-x', String(cols), '-y', String(rows - 1)]);
 }
 
 function getSessionCwd(sessionName) {
