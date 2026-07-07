@@ -5,7 +5,9 @@ if (!globalThis.fetch) globalThis.fetch = require('node-fetch');
 ['log','error','warn'].forEach(m => {
   const orig = console[m];
   console[m] = (...args) => {
-    const ts = new Date().toLocaleString('sv', { hour12: false }).replace('T', ' ');
+    const d = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const ts = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
     orig(`[${ts}]`, ...args);
   };
 });
