@@ -18,6 +18,7 @@ const WebSocket = require('ws');
 const ptyManager = require('./ptyManager');
 const rtcManager = require('./rtcManager');
 const { runSetup } = require('./setup');
+const { HttpTransport } = require('./httpTransport');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -50,6 +51,11 @@ let TURN_SERVERS = [];
 
 let ws = null;
 let reconnectDelay = 1000;
+let httpTransport = null;
+let wsFailCount = 0;
+const WS_FAIL_THRESHOLD = 3;
+const WS_RETRY_INTERVAL = 60_000;
+let wsRetryTimer = null;
 
 // channelId → { ptyInstance, sessionName }
 const channels = new Map();
@@ -99,6 +105,10 @@ function buildWsUrl(hubUrl, token) {
 // ── Send helpers ───────────────────────────────────────────────────────────────
 
 function send(msg) {
+  if (httpTransport?.active) {
+    httpTransport.send(msg);
+    return;
+  }
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
@@ -111,6 +121,10 @@ function sendSessions() {
 }
 
 function sendPtyData(channelId, data) {
+  if (httpTransport?.active) {
+    httpTransport.sendBinary(channelId, data);
+    return;
+  }
   if (ws?.readyState !== WebSocket.OPEN) return;
   const idBuf = Buffer.alloc(CHANNEL_ID_LEN);
   idBuf.write(channelId, 'ascii');
@@ -299,6 +313,45 @@ function handleMessage(data, isBinary) {
 
 // ── Connection ────────────────────────────────────────────────────────────────
 
+function startHttpFallback(token) {
+  if (httpTransport?.active) return;
+  console.log('Switching to HTTP polling fallback');
+  httpTransport = new HttpTransport(config.hubUrl, token);
+  httpTransport.onMessage((data, isBinary) => {
+    handleMessage(data, isBinary);
+  });
+  httpTransport.onClose(() => {
+    console.log('HTTP polling transport closed');
+    if (httpTransport) {
+      httpTransport.stop();
+      httpTransport = null;
+    }
+  });
+  httpTransport.start();
+}
+
+function stopHttpFallback() {
+  if (httpTransport) {
+    httpTransport.stop();
+    httpTransport = null;
+  }
+  wsFailCount = 0;
+  if (wsRetryTimer) {
+    clearTimeout(wsRetryTimer);
+    wsRetryTimer = null;
+  }
+}
+
+function scheduleWsRetry() {
+  if (wsRetryTimer) return;
+  wsRetryTimer = setTimeout(() => {
+    wsRetryTimer = null;
+    if (ws?.readyState === WebSocket.OPEN) return; // already connected
+    console.log('Retrying WebSocket connection…');
+    connect();
+  }, WS_RETRY_INTERVAL);
+}
+
 function scheduleReconnect() {
   console.log(`Reconnecting in ${reconnectDelay / 1000}s…`);
   setTimeout(connect, reconnectDelay);
@@ -319,6 +372,9 @@ async function connect() {
     ws.on('open', () => {
       console.log(`Connected to ${hubUrl}`);
       reconnectDelay = config.reconnect.initialDelay;
+      wsFailCount = 0;
+      // Stop HTTP fallback if WS is now working
+      stopHttpFallback();
       ws.isAlive = true;
       pingTimer = setInterval(() => {
         if (!ws.isAlive) { ws.terminate(); return; }
@@ -337,12 +393,31 @@ async function connect() {
       console.log(`Disconnected from Hub (${code} ${reason}).`);
       for (const [, ch] of channels) try { ch.ptyInstance?.kill(); } catch {}
       channels.clear();
-      scheduleReconnect();
+      wsFailCount++;
+      if (wsFailCount >= WS_FAIL_THRESHOLD && token) {
+        startHttpFallback(token);
+        scheduleWsRetry();
+      } else {
+        scheduleReconnect();
+      }
     });
 
-    ws.on('error', err => console.error('WebSocket error:', err.message));
+    ws.on('error', err => {
+      console.error('WebSocket error:', err.message);
+    });
   } catch (err) {
     console.error('Startup error:', err.message);
+    wsFailCount++;
+    if (wsFailCount >= WS_FAIL_THRESHOLD) {
+      // Try to get a token for HTTP polling
+      try {
+        const { hubUrl } = config;
+        const token = await loginToHub(hubUrl);
+        startHttpFallback(token);
+        scheduleWsRetry();
+        return;
+      } catch {}
+    }
     scheduleReconnect();
   }
 }
